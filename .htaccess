@@ -1,4 +1,14 @@
+# Apache / XAMPP: the web root is public/. Point your DocumentRoot at public/ if you can;
+# otherwise these rules forward everything into public/ and block the rest of the project.
 Options -Indexes
-<FilesMatch "^(database\.sql|README\.md)$">
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteRule ^(data|src|pages|migrations|seeds|bin|tests|skills|docs)(/|$) - [F,L]
+  RewriteRule ^\.env - [F,L]
+  RewriteRule ^$ public/ [L]
+  RewriteCond %{REQUEST_URI} !/public/
+  RewriteRule ^(.*)$ public/$1 [L]
+</IfModule>
+<FilesMatch "^(\.env.*|.*\.(sqlite|sqlite-wal|sqlite-shm|sql|md|sh|log)|Makefile)$">
   Require all denied
 </FilesMatch>

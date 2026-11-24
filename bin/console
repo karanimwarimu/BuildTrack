@@ -1,0 +1,366 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * BuildTrack command-line tool. Run `php bin/console help` for the command list.
+ * Works on the database configured in .env (DB_PATH).
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("CLI only.\n");
+}
+require __DIR__ . '/../src/bootstrap.php';
+require_once __DIR__ . '/../src/mysql_import.php';
+require_once __DIR__ . '/../seeds/demo.php';
+
+/* ------------------------------------------------------------------ tiny CLI helpers */
+
+function out(string $msg = ''): void { fwrite(STDOUT, $msg . PHP_EOL); }
+function err(string $msg): void { fwrite(STDERR, "\033[31m$msg\033[0m" . PHP_EOL); }
+function ok(string $msg): void { out("\033[32m✔\033[0m $msg"); }
+function warn(string $msg): void { out("\033[33m!\033[0m $msg"); }
+function fail(string $msg, int $code = 1): never { err($msg); exit($code); }
+
+/** Split argv into positional args and --options. */
+function parse_args(array $argv): array
+{
+    $args = [];
+    $opts = [];
+    foreach ($argv as $a) {
+        if (preg_match('/^--([a-z0-9-]+)(?:=(.*))?$/', $a, $m)) {
+            $opts[$m[1]] = $m[2] ?? true;
+        } else {
+            $args[] = $a;
+        }
+    }
+    return [$args, $opts];
+}
+
+function prompt_hidden(string $label): string
+{
+    if (!stream_isatty(STDIN)) {
+        return trim((string)fgets(STDIN));
+    }
+    fwrite(STDOUT, $label);
+    shell_exec('stty -echo 2>/dev/null');
+    $value = trim((string)fgets(STDIN));
+    shell_exec('stty echo 2>/dev/null');
+    fwrite(STDOUT, PHP_EOL);
+    return $value;
+}
+
+function require_user(PDO $pdo, ?string $email): array
+{
+    if (!$email) {
+        fail('Give the account email address.');
+    }
+    return find_user_by_email($pdo, $email) ?? fail("No account found for $email. List accounts with: php bin/console users");
+}
+
+function open_db(): PDO
+{
+    try {
+        $pdo = db();
+    } catch (Throwable $e) {
+        fail('Cannot open database ' . db_path() . ': ' . $e->getMessage());
+    }
+    if ($applied = migrate($pdo)) {
+        ok('Applied migrations: ' . implode(', ', $applied));
+    }
+    return $pdo;
+}
+
+const HELP = <<<TXT
+BuildTrack console — php bin/console <command> [arguments] [--options]
+
+Setup & running
+  init                         Create .env (from .env.example) and data/ folders if missing
+  migrate                      Create/upgrade the SQLite schema; apply ADMIN_EMAIL from .env
+  doctor                       Health check: schema, integrity, WAL, backups, config warnings
+  seed [--fresh] [--force]     Load demo data (--fresh deletes the current database first)
+  free-port <port>             Print the first free TCP port at or above <port> (used by start.sh)
+
+Accounts & admin access
+  users                        List accounts
+  make-admin <email>           Promote an existing account to administrator
+  set-role <email> <role>      Roles: admin, project_manager, site_supervisor, worker
+  create-user <email> <name> [role] [--password=...]   Create an account (password generated if omitted)
+  reset-password <email> [--password=...]  Set a temporary password (forced change at next login)
+  reset-link <email>           Print a single-use password reset link
+  activate <email> | deactivate <email>
+  unlock <email>               Clear failed sign-in attempts (lockout)
+
+Data
+  backup [--output=file] [--keep=N]   Consistent snapshot to data/backups/ (VACUUM INTO)
+  backups                      List backups
+  restore <file> [--yes]       Replace the database with a backup (stop the server first)
+  import-mysql <dump.sql> [--force] [--source-tz=Africa/Nairobi]
+                               Import data from the old MariaDB/MySQL version
+  audit [--limit=30]           Show the latest audit log entries
+
+TXT;
+
+/* ------------------------------------------------------------------ commands */
+
+[$args, $opts] = parse_args(array_slice($argv, 1));
+$command = array_shift($args) ?? 'help';
+
+try {
+    switch ($command) {
+        case 'help':
+        case '--help':
+        case '-h':
+            out(HELP);
+            break;
+
+        case 'init':
+            $env = env_file_path();
+            if (!is_file($env)) {
+                if (!copy(APP_ROOT . '/.env.example', $env)) {
+                    fail("Could not create $env");
+                }
+                @chmod($env, 0600);
+                ok('Created .env with safe local defaults (edit it to change port, timezone, SMTP, admin bootstrap).');
+            }
+            foreach (['', 'logs', 'backups', 'uploads', 'sessions'] as $sub) {
+                $dir = data_path($sub);
+                if (!is_dir($dir) && !mkdir($dir, 0775, true)) {
+                    fail("Could not create $dir");
+                }
+            }
+            if (!is_writable(data_path())) {
+                fail(data_path() . ' is not writable. Fix with: chmod u+w ' . data_path());
+            }
+            break;
+
+        case 'migrate':
+            $pdo = open_db();
+            ok('Schema is at version ' . schema_version($pdo) . ' (' . db_path() . ')');
+            if ($note = ensure_env_admin($pdo)) {
+                str_starts_with($note, 'ADMIN_EMAIL=') ? warn($note) : ok($note);
+            }
+            if (user_count($pdo) === 0 && !is_demo_mode()) {
+                warn('No accounts yet: the first person to register in the browser becomes the administrator' . (config_bool('FIRST_USER_IS_ADMIN') ? '.' : ' (disabled: FIRST_USER_IS_ADMIN=false — use make-admin).'));
+            }
+            foreach (config_warnings() as $w) {
+                warn($w);
+            }
+            break;
+
+        case 'doctor':
+        case 'status':
+            $pdo = open_db();
+            $h = system_health($pdo, isset($opts['full']));
+            foreach ($h['checks'] as [$label, $value, $good]) {
+                out(sprintf('  %s %-24s %s', $good ? "\033[32m✔\033[0m" : "\033[31m✘\033[0m", $label, $value));
+            }
+            out();
+            foreach ($h['facts'] as $k => $v) {
+                out(sprintf('    %-24s %s', $k, $v));
+            }
+            out('    Records                  ' . implode(', ', array_map(fn($k, $v) => "$k=$v", array_keys($h['tables']), $h['tables'])));
+            foreach ($h['warnings'] as $w) {
+                warn($w);
+            }
+            break;
+
+        case 'seed':
+            if (!is_local_env() && !isset($opts['force'])) {
+                fail('Refusing to load demo data with APP_ENV=' . config('APP_ENV') . '. Add --force if you really mean it.');
+            }
+            if (isset($opts['fresh'])) {
+                $path = db_path();
+                if (is_file($path)) {
+                    $backup = create_backup(db());
+                    db_set(null);
+                    foreach (['', '-wal', '-shm'] as $s) {
+                        @unlink($path . $s);
+                    }
+                    ok('Old database backed up to ' . $backup . ' and removed.');
+                }
+            }
+            $pdo = open_db();
+            $creds = seed_demo($pdo);
+            ok('Demo data loaded. Sign in with any of these accounts:');
+            foreach ($creds as [$email, $role]) {
+                out(sprintf('    %-32s %-18s password: %s', $email, role_label($role), DEMO_PASSWORD));
+            }
+            break;
+
+        case 'free-port':
+            $port = (int)($args[0] ?? config('APP_PORT', '8080'));
+            $host = config('APP_HOST', '127.0.0.1');
+            for ($p = $port; $p < $port + 50; $p++) {
+                $sock = @stream_socket_server("tcp://$host:$p", $errno, $errstr);
+                if ($sock) {
+                    fclose($sock);
+                    out((string)$p);
+                    exit(0);
+                }
+            }
+            fail("No free port found between $port and " . ($port + 49));
+
+        case 'users':
+            $pdo = open_db();
+            $rows = db_all($pdo, 'SELECT id, email, full_name, role, is_active, last_login_at FROM users ORDER BY id');
+            if (!$rows) {
+                warn('No accounts yet. Register in the browser or run: php bin/console create-user you@example.com "Your Name" admin');
+            }
+            foreach ($rows as $r) {
+                out(sprintf('  #%-4d %-32s %-26s %-16s %s  last login: %s', $r['id'], $r['email'], $r['full_name'], $r['role'], $r['is_active'] ? 'active  ' : 'INACTIVE', $r['last_login_at'] ?? 'never'));
+            }
+            break;
+
+        case 'make-admin':
+            $pdo = open_db();
+            $u = require_user($pdo, $args[0] ?? null);
+            change_user_role($pdo, (int)$u['id'], 'admin');
+            if (!(int)$u['is_active']) {
+                set_user_active($pdo, (int)$u['id'], true);
+            }
+            audit('admin.cli_promoted', 'user', (int)$u['id'], ['from' => $u['role']], null);
+            ok("{$u['email']} is now an administrator. They may need to reload the page.");
+            break;
+
+        case 'set-role':
+            $pdo = open_db();
+            $u = require_user($pdo, $args[0] ?? null);
+            $role = (string)($args[1] ?? '');
+            $old = change_user_role($pdo, (int)$u['id'], $role);
+            audit('admin.role_changed', 'user', (int)$u['id'], ['from' => $old, 'to' => $role, 'via' => 'cli'], null);
+            ok("{$u['email']}: $old → $role");
+            break;
+
+        case 'create-user':
+            $pdo = open_db();
+            [$email, $name, $role] = [$args[0] ?? '', $args[1] ?? '', $args[2] ?? 'worker'];
+            if ($email === '' || $name === '') {
+                fail('Usage: php bin/console create-user <email> "<full name>" [role] [--password=...]');
+            }
+            $password = is_string($opts['password'] ?? null) ? $opts['password'] : generate_password();
+            $u = create_user($pdo, $name, $email, $password, $role, !isset($opts['password']));
+            audit('admin.user_created', 'user', (int)$u['id'], ['email' => $u['email'], 'role' => $role, 'via' => 'cli'], null);
+            ok("Created {$u['email']} ({$role}).");
+            if (!isset($opts['password'])) {
+                out("    Temporary password: $password   (must be changed at first sign-in)");
+            }
+            break;
+
+        case 'reset-password':
+            $pdo = open_db();
+            $u = require_user($pdo, $args[0] ?? null);
+            $given = is_string($opts['password'] ?? null) ? $opts['password'] : null;
+            if ($given === null && stream_isatty(STDIN) && !isset($opts['generate'])) {
+                $given = prompt_hidden('New password (leave blank to generate): ') ?: null;
+            }
+            $password = $given ?? generate_password();
+            set_user_password($pdo, (int)$u['id'], $password, $given === null);
+            db_exec($pdo, 'DELETE FROM login_attempts WHERE email = ? AND success = 0', [$u['email']]);
+            audit('admin.password_set', 'user', (int)$u['id'], ['via' => 'cli'], null);
+            ok("Password reset for {$u['email']}; existing sessions were signed out.");
+            if ($given === null) {
+                out("    Temporary password: $password   (must be changed at next sign-in)");
+            }
+            break;
+
+        case 'reset-link':
+            $pdo = open_db();
+            $u = require_user($pdo, $args[0] ?? null);
+            $link = reset_link(create_password_reset($pdo, (int)$u['id'], null, 'cli'));
+            audit('admin.reset_link_created', 'user', (int)$u['id'], ['via' => 'cli'], null);
+            ok("Single-use reset link for {$u['email']} (valid " . config_int('RESET_TOKEN_TTL_MINUTES', 60) . ' minutes):');
+            out("    $link");
+            break;
+
+        case 'activate':
+        case 'deactivate':
+            $pdo = open_db();
+            $u = require_user($pdo, $args[0] ?? null);
+            set_user_active($pdo, (int)$u['id'], $command === 'activate');
+            audit($command === 'activate' ? 'admin.user_activated' : 'admin.user_deactivated', 'user', (int)$u['id'], ['via' => 'cli'], null);
+            ok("{$u['email']} {$command}d.");
+            break;
+
+        case 'unlock':
+            $pdo = open_db();
+            $email = normalize_email((string)($args[0] ?? ''));
+            $n = db_exec($pdo, 'DELETE FROM login_attempts WHERE email = ? AND success = 0', [$email]);
+            ok("Cleared $n failed sign-in attempts for $email.");
+            break;
+
+        case 'backup':
+            $pdo = open_db();
+            $file = create_backup($pdo, is_string($opts['output'] ?? null) ? $opts['output'] : null);
+            audit('backup.created', null, null, ['file' => basename($file), 'via' => 'cli'], null);
+            ok("Backup written: $file (" . human_bytes((int)filesize($file)) . ')');
+            if (isset($opts['keep'])) {
+                foreach (prune_backups((int)$opts['keep']) as $gone) {
+                    out("    pruned $gone");
+                }
+            }
+            break;
+
+        case 'backups':
+            foreach (list_backups() as $b) {
+                out(sprintf('  %-48s %10s  %s', $b['name'], human_bytes($b['size']), date('Y-m-d H:i', $b['mtime'])));
+            }
+            break;
+
+        case 'restore':
+            $file = $args[0] ?? fail('Usage: php bin/console restore <backup.sqlite> [--yes]');
+            verify_database_file($file);
+            if (!isset($opts['yes'])) {
+                out('This replaces ' . db_path() . " with $file.");
+                out('Stop the web server first (Ctrl+C in the ./start.sh window). A safety backup of the current database is taken.');
+                fwrite(STDOUT, 'Type "restore" to continue: ');
+                if (trim((string)fgets(STDIN)) !== 'restore') {
+                    fail('Cancelled.');
+                }
+            }
+            db_set(null);
+            $safety = restore_backup($file, db_path());
+            ok('Database restored from ' . $file);
+            if ($safety) {
+                out("    Previous database saved as $safety");
+            }
+            $pdo = open_db(); // applies any newer migrations to an older backup
+            audit('backup.restored', null, null, ['file' => basename($file)], null);
+            break;
+
+        case 'import-mysql':
+            $file = $args[0] ?? fail('Usage: php bin/console import-mysql <dump.sql> [--force] [--source-tz=Africa/Nairobi]');
+            $pdo = open_db();
+            $tz = is_string($opts['source-tz'] ?? null) ? $opts['source-tz'] : (string)config('APP_TIMEZONE', 'UTC');
+            if (user_count($pdo) > 0 && !isset($opts['force'])) {
+                fail('The SQLite database already has data. Re-run with --force to wipe it (a backup is taken first).');
+            }
+            if (user_count($pdo) > 0) {
+                ok('Safety backup: ' . create_backup($pdo));
+            }
+            $counts = import_mysql_dump($pdo, (string)file_get_contents($file), $tz);
+            foreach ($counts as $table => $n) {
+                out(sprintf('    %-18s %d rows', $table, $n));
+            }
+            audit('import.mysql', null, null, $counts + ['file' => basename($file)], null);
+            ok('Import complete. Existing passwords keep working (bcrypt hashes are compatible).');
+            break;
+
+        case 'audit':
+            $pdo = open_db();
+            $limit = max(1, (int)($opts['limit'] ?? 30));
+            foreach (array_reverse(db_all($pdo, "SELECT a.*, u.email FROM audit_log a LEFT JOIN users u ON u.id = a.user_id ORDER BY a.id DESC LIMIT $limit")) as $a) {
+                out(sprintf('  %s UTC  %-24s %-34s %s %s', $a['created_at'], $a['email'] ?? 'system', $a['action'], $a['entity_type'] ? "{$a['entity_type']}#{$a['entity_id']}" : '', $a['details'] ?? ''));
+            }
+            break;
+
+        default:
+            err("Unknown command: $command");
+            out(HELP);
+            exit(1);
+    }
+} catch (UserError $e) {
+    fail($e->getMessage());
+} catch (Throwable $e) {
+    fail(get_class($e) . ': ' . $e->getMessage());
+}

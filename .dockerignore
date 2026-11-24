@@ -1,0 +1,9 @@
+.git
+.env
+data/*
+!data/.htaccess
+!data/.gitkeep
+tests/tmp
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

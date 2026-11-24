@@ -1,0 +1,10 @@
+# Local configuration and secrets
+.env
+# Runtime data: database, WAL files, uploads, backups, logs, sessions
+data/*
+!data/.htaccess
+!data/.gitkeep
+*.sqlite-wal
+*.sqlite-shm
+# Test scratch space
+tests/tmp/

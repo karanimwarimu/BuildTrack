@@ -1,0 +1,32 @@
+# Render Blueprint — public DEMO of BuildTrack on Render's free plan.
+# Deploy: Render dashboard → New → Blueprint → pick this repository.
+#
+# IMPORTANT: free instances have no persistent disk. The SQLite database lives on the
+# container's temporary filesystem and is WIPED on every deploy, restart and idle spin-down
+# (after ~15 minutes without traffic). DEMO_MODE re-loads the demo data on each start.
+# For real use, switch to a paid plan with a disk — see run.md, "Hosting on Render".
+services:
+  - type: web
+    name: buildtrack-demo
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz.php
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: production          # no on-screen reset links, no error details
+      - key: DEMO_MODE
+        value: "true"              # seed demo data on boot, lock the shared demo accounts
+      - key: TRUST_PROXY
+        value: "true"              # Render/Cloudflare terminate HTTPS and pass the visitor IP
+      - key: ALLOW_REGISTRATION
+        value: "false"             # visitors use the demo accounts; no personal data is collected
+      - key: APP_TIMEZONE
+        value: Africa/Nairobi
+      - key: CURRENCY
+        value: KSh
+      - key: UPLOAD_MAX_MB
+        value: "2"                 # keep the public demo from being used as file hosting
+      - key: LOG_STDERR
+        value: "true"              # app errors appear in Render's Logs tab
