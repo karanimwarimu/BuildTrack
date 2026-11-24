@@ -175,6 +175,8 @@ Run `make logs` to follow all three.
 
 ## Hosting on Render (free demo)
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/karanimwarimu/BuildTrack)
+
 The repository includes a `Dockerfile` and a `render.yaml` Blueprint for a free public demo on [Render](https://render.com). Push to GitHub, then in Render choose **New → Blueprint**.
 
 On the free plan the data resets on every restart, so it runs in `DEMO_MODE` with locked demo accounts. Step-by-step instructions, and how to move to a paid plan with a persistent disk for real use, are in [run.md](run.md#4-hosting-on-render-free-public-demo).

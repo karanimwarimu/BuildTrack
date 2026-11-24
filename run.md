@@ -207,6 +207,12 @@ git push -u origin main
 
 ### Step 2: Create the service on Render
 
+**Quickest:** click this button (also in the README), sign in to Render, then click **Apply**:
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/karanimwarimu/BuildTrack)
+
+**Or by hand:**
+
 1. Sign in at [dashboard.render.com](https://dashboard.render.com) and connect your GitHub account.
 2. Click **New → Blueprint**, choose your `buildtrack` repository, and click **Apply**.
 3. Render reads `render.yaml`, builds the Docker image (3–5 minutes the first time), and starts the service on the **Free** plan.
